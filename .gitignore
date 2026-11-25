@@ -1,0 +1,21 @@
+# Python
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Training outputs
+tb_logs/
+runs/
+*.zip
+*.pt
+*.pth
+*.ckpt
+checkpoints/
+models/
+logs/
+
+# System
+.DS_Store
+*.log
