@@ -34,6 +34,70 @@ def select_actions(
     )
 
 
+def food_target_action(
+    target: tuple[int, int] | None,
+    frame_width: int,
+    frame_height: int,
+) -> tuple[str, ...]:
+    if target is None:
+        return ()
+    if frame_width <= 0 or frame_height <= 0:
+        raise ValueError("Frame dimensions must be greater than zero")
+
+    dx = target[0] - frame_width / 2
+    dy = target[1] - frame_height / 2
+    if abs(dx) >= abs(dy):
+        return ("right" if dx > 0 else "left",)
+    return ("down" if dy > 0 else "up",)
+
+
+def detect_food_target(frame, cv2) -> tuple[int, int] | None:
+    """Find the nearest round, saturated neon object away from the screen center."""
+    height, width = frame.shape[:2]
+    minimum_dimension = min(width, height)
+    bgr = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, (0, 100, 150), (179, 255, 255))
+    contours, _ = cv2.findContours(
+        mask,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE,
+    )
+
+    center_x, center_y = width / 2, height / 2
+    min_diameter = max(4, minimum_dimension * 0.005)
+    max_diameter = minimum_dimension * 0.08
+    center_exclusion = minimum_dimension * 0.025
+    candidates = []
+
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        perimeter = cv2.arcLength(contour, True)
+        if area <= 0 or perimeter <= 0:
+            continue
+        x, y, box_width, box_height = cv2.boundingRect(contour)
+        diameter = max(box_width, box_height)
+        aspect_ratio = box_width / box_height
+        circularity = 4 * 3.141592653589793 * area / (perimeter * perimeter)
+        if (
+            diameter < min_diameter
+            or diameter > max_diameter
+            or not 0.65 <= aspect_ratio <= 1.55
+            or circularity < 0.35
+        ):
+            continue
+
+        point = (x + box_width // 2, y + box_height // 2)
+        distance_squared = (point[0] - center_x) ** 2 + (point[1] - center_y) ** 2
+        if distance_squared <= center_exclusion**2:
+            continue
+        candidates.append((distance_squared, point))
+
+    if not candidates:
+        return None
+    return min(candidates, key=lambda candidate: candidate[0])[1]
+
+
 def _build_legacy_policy(torch, action_count: int):
     """Build the original architecture for checkpoints trained before the MPS fix."""
     nn = torch.nn
@@ -120,7 +184,6 @@ def run(args: argparse.Namespace) -> None:
         import cv2
         import mss
         import numpy as np
-        import torch
         from pynput import keyboard
     except ImportError as exc:
         raise RuntimeError(
@@ -128,8 +191,19 @@ def run(args: argparse.Namespace) -> None:
             "Install them with: python -m pip install -r requirements.txt"
         ) from exc
 
-    device = _select_device(torch, args.device)
-    model, checkpoint, action_labels = _load_policy(torch, args.model, device)
+    if args.food_seeking:
+        model = checkpoint = action_labels = device = None
+    else:
+        try:
+            import torch
+        except ImportError as exc:
+            raise RuntimeError(
+                "Model testing requires PyTorch. "
+                "Install it with: python -m pip install -r requirements.txt"
+            ) from exc
+        device = _select_device(torch, args.device)
+        model, checkpoint, action_labels = _load_policy(torch, args.model, device)
+
     key_by_action = {
         "left": keyboard.Key.left,
         "right": keyboard.Key.right,
@@ -148,13 +222,19 @@ def run(args: argparse.Namespace) -> None:
     listener.start()
     controller = keyboard.Controller() if args.play else None
     held_keys = set()
-    frame_width = checkpoint["frame_width"]
-    frame_height = checkpoint["frame_height"]
+    if checkpoint is not None:
+        frame_width = checkpoint["frame_width"]
+        frame_height = checkpoint["frame_height"]
     frame_interval = 1.0 / args.fps
     last_print = 0.0
 
     try:
         print("Put the game in fullscreen on the selected monitor.")
+        if args.food_seeking:
+            print(
+                "Experimental food targeting: aiming at the nearest detected "
+                "neon blob from screen center."
+            )
         if args.play:
             print("LIVE CONTROL ENABLED. Press Esc to stop and release all keys.")
         else:
@@ -164,7 +244,7 @@ def run(args: argparse.Namespace) -> None:
             if stop_event.wait(1):
                 return
 
-        with mss.mss() as screen:
+        with mss.MSS() as screen:
             if args.monitor < 0 or args.monitor >= len(screen.monitors):
                 raise ValueError(
                     f"Monitor {args.monitor} is unavailable; "
@@ -175,21 +255,35 @@ def run(args: argparse.Namespace) -> None:
             print("Running. Press Esc to stop.")
             while not stop_event.is_set():
                 raw_frame = np.asarray(screen.grab(monitor))
-                rgb_frame = cv2.cvtColor(raw_frame, cv2.COLOR_BGRA2RGB)
-                rgb_frame = cv2.resize(
-                    rgb_frame,
-                    (frame_width, frame_height),
-                    interpolation=cv2.INTER_AREA,
-                )
-                image = np.ascontiguousarray(np.transpose(rgb_frame, (2, 0, 1)))
-                observations = torch.from_numpy(image).unsqueeze(0)
-                observations = observations.to(device=device, dtype=torch.float32) / 255.0
+                target = None
+                if args.food_seeking:
+                    target = detect_food_target(raw_frame, cv2)
+                    actions = set(
+                        food_target_action(
+                            target,
+                            raw_frame.shape[1],
+                            raw_frame.shape[0],
+                        )
+                    )
+                else:
+                    rgb_frame = cv2.cvtColor(raw_frame, cv2.COLOR_BGRA2RGB)
+                    rgb_frame = cv2.resize(
+                        rgb_frame,
+                        (frame_width, frame_height),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                    image = np.ascontiguousarray(np.transpose(rgb_frame, (2, 0, 1)))
+                    observations = torch.from_numpy(image).unsqueeze(0)
+                    observations = observations.to(
+                        device=device,
+                        dtype=torch.float32,
+                    ) / 255.0
 
-                with torch.no_grad():
-                    probabilities = torch.sigmoid(model(observations))[0].cpu().tolist()
-                actions = set(
-                    select_actions(action_labels, probabilities, args.threshold)
-                )
+                    with torch.no_grad():
+                        probabilities = torch.sigmoid(model(observations))[0].cpu().tolist()
+                    actions = set(
+                        select_actions(action_labels, probabilities, args.threshold)
+                    )
 
                 if controller is not None:
                     desired_keys = {key_by_action[action] for action in actions}
@@ -201,9 +295,16 @@ def run(args: argparse.Namespace) -> None:
 
                 now = time.monotonic()
                 if now - last_print >= 0.5:
-                    action_text = "+".join(sorted(actions)) or "none"
-                    mode = "PLAY" if args.play else "PREVIEW"
-                    print(f"\r{mode} predicted: {action_text:<24}", end="", flush=True)
+                    if args.food_seeking:
+                        action_text = "+".join(sorted(actions)) or "no target"
+                        target_text = f" target={target}" if target is not None else ""
+                        mode = "FOOD PLAY" if args.play else "FOOD PREVIEW"
+                        status = f"{mode}: {action_text}{target_text}"
+                    else:
+                        action_text = "+".join(sorted(actions)) or "none"
+                        mode = "PLAY" if args.play else "PREVIEW"
+                        status = f"{mode} predicted: {action_text}"
+                    print(f"\r{status:<64}", end="", flush=True)
                     last_print = now
 
                 deadline += frame_interval
@@ -218,7 +319,10 @@ def run(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Preview a trained arrow-key policy or let it control the game."
+        description=(
+            "Preview a trained arrow-key policy, use experimental food targeting, "
+            "or explicitly let either control the game."
+        )
     )
     parser.add_argument(
         "--model",
@@ -235,9 +339,17 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
     )
     parser.add_argument(
+        "--food-seeking",
+        action="store_true",
+        help=(
+            "Use experimental neon-blob targeting instead of the trained model; "
+            "preview only unless --play is also given"
+        ),
+    )
+    parser.add_argument(
         "--play",
         action="store_true",
-        help="Send predicted arrow keys to the game; default is preview-only",
+        help="Send selected arrow keys to the game; default is preview-only",
     )
     return parser
 
