@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from train import action_vocabulary, load_annotations
+from train import _conv_feature_size, action_vocabulary, load_annotations
 
 
 class LoadAnnotationsTests(unittest.TestCase):
@@ -100,6 +100,16 @@ class LoadAnnotationsTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "at least one non-empty action label"):
             load_annotations(self.labels, self.videos)
+
+
+class ConvFeatureSizeTests(unittest.TestCase):
+    def test_computes_convolution_output_dimensions(self):
+        self.assertEqual(_conv_feature_size(84), 7)
+        self.assertEqual(_conv_feature_size(36), 1)
+
+    def test_rejects_dimensions_too_small_for_network(self):
+        with self.assertRaisesRegex(ValueError, "too small"):
+            _conv_feature_size(35)
 
 
 if __name__ == "__main__":
