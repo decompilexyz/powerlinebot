@@ -7,14 +7,19 @@ import argparse
 import sys
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Sequence
 
 from record_gameplay import ARROW_ACTIONS
 from train import (
     _build_policy,
+    _build_video_policy,
     _conv_feature_size,
     _select_device,
+    VIDEO_ARCHITECTURE,
+    VIDEO_NORMALIZATION_MEAN,
+    VIDEO_NORMALIZATION_STD,
 )
 
 
@@ -149,6 +154,28 @@ def _load_policy(torch, checkpoint_path: Path, device):
         )
 
     state = checkpoint["model_state_dict"]
+    if checkpoint.get("architecture") == VIDEO_ARCHITECTURE:
+        if checkpoint.get("input_layout") != "NCTHW":
+            raise ValueError("Video checkpoint must use NCTHW input layout")
+        if checkpoint.get("num_frames", 0) < 2:
+            raise ValueError("Video checkpoint has an invalid num_frames value")
+        if (
+            tuple(checkpoint.get("normalization_mean", ()))
+            != VIDEO_NORMALIZATION_MEAN
+            or tuple(checkpoint.get("normalization_std", ()))
+            != VIDEO_NORMALIZATION_STD
+        ):
+            raise ValueError("Video checkpoint uses unsupported normalization values")
+        model = _build_video_policy(torch, len(action_labels), pretrained=False)
+        model.load_state_dict(state)
+        model.to(device)
+        model.eval()
+        return model, checkpoint, action_labels
+
+    if checkpoint.get("architecture") not in (None, "legacy_2d"):
+        raise ValueError(
+            f"Unsupported model architecture: {checkpoint['architecture']!r}"
+        )
     classifier_weight = state.get("classifier.0.weight")
     if classifier_weight is None:
         raise ValueError("Checkpoint is missing its policy classifier weights")
@@ -193,6 +220,7 @@ def run(args: argparse.Namespace) -> None:
 
     if args.food_seeking:
         model = checkpoint = action_labels = device = None
+        is_video_policy = False
     else:
         try:
             import torch
@@ -203,6 +231,7 @@ def run(args: argparse.Namespace) -> None:
             ) from exc
         device = _select_device(torch, args.device)
         model, checkpoint, action_labels = _load_policy(torch, args.model, device)
+        is_video_policy = checkpoint.get("architecture") == VIDEO_ARCHITECTURE
 
     key_by_action = {
         "left": keyboard.Key.left,
@@ -225,6 +254,22 @@ def run(args: argparse.Namespace) -> None:
     if checkpoint is not None:
         frame_width = checkpoint["frame_width"]
         frame_height = checkpoint["frame_height"]
+    frame_buffer = (
+        deque(maxlen=checkpoint["num_frames"])
+        if is_video_policy
+        else None
+    )
+    if is_video_policy:
+        normalization_mean = torch.tensor(
+            checkpoint["normalization_mean"],
+            device=device,
+            dtype=torch.float32,
+        ).view(1, 3, 1, 1, 1)
+        normalization_std = torch.tensor(
+            checkpoint["normalization_std"],
+            device=device,
+            dtype=torch.float32,
+        ).view(1, 3, 1, 1, 1)
     frame_interval = 1.0 / args.fps
     last_print = 0.0
 
@@ -273,17 +318,44 @@ def run(args: argparse.Namespace) -> None:
                         interpolation=cv2.INTER_AREA,
                     )
                     image = np.ascontiguousarray(np.transpose(rgb_frame, (2, 0, 1)))
-                    observations = torch.from_numpy(image).unsqueeze(0)
-                    observations = observations.to(
+                    observations = torch.from_numpy(image).to(
                         device=device,
                         dtype=torch.float32,
                     ) / 255.0
-
-                    with torch.no_grad():
-                        probabilities = torch.sigmoid(model(observations))[0].cpu().tolist()
-                    actions = set(
-                        select_actions(action_labels, probabilities, args.threshold)
-                    )
+                    if is_video_policy:
+                        frame_buffer.append(observations)
+                        if len(frame_buffer) < frame_buffer.maxlen:
+                            actions = set()
+                        else:
+                            observations = torch.stack(tuple(frame_buffer), dim=1)
+                            observations = observations.unsqueeze(0)
+                            observations = (
+                                observations - normalization_mean
+                            ) / normalization_std
+                            with torch.no_grad():
+                                probabilities = torch.sigmoid(model(observations))[
+                                    0
+                                ].cpu().tolist()
+                            actions = set(
+                                select_actions(
+                                    action_labels,
+                                    probabilities,
+                                    args.threshold,
+                                )
+                            )
+                    else:
+                        observations = observations.unsqueeze(0)
+                        with torch.no_grad():
+                            probabilities = torch.sigmoid(model(observations))[
+                                0
+                            ].cpu().tolist()
+                        actions = set(
+                            select_actions(
+                                action_labels,
+                                probabilities,
+                                args.threshold,
+                            )
+                        )
 
                 if controller is not None:
                     desired_keys = {key_by_action[action] for action in actions}

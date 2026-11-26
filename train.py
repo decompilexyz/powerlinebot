@@ -6,10 +6,16 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import random
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
+
+
+VIDEO_ARCHITECTURE = "torchvision_r3d_18"
+VIDEO_NORMALIZATION_MEAN = (0.43216, 0.394666, 0.37645)
+VIDEO_NORMALIZATION_STD = (0.22803, 0.22145, 0.216989)
 
 
 @dataclass(frozen=True)
@@ -159,7 +165,124 @@ def _build_policy(torch, action_count: int, frame_width: int, frame_height: int)
     return VisionPolicy()
 
 
-def _prepare_dataset(annotations, actions, frame_width, frame_height, cv2, np, torch):
+def _build_video_policy(torch, action_count: int, pretrained: bool = False):
+    try:
+        from torchvision.models.video import R3D_18_Weights, r3d_18
+    except ImportError as exc:
+        raise RuntimeError(
+            "Video training requires torchvision. "
+            "Install it with: python -m pip install -r requirements.txt"
+        ) from exc
+
+    weights = R3D_18_Weights.DEFAULT if pretrained else None
+    model = r3d_18(weights=weights)
+    if pretrained:
+        for parameter in model.parameters():
+            parameter.requires_grad = False
+    model.fc = torch.nn.Linear(model.fc.in_features, action_count)
+    return model
+
+
+def sample_clip_indices(
+    frame_index: int,
+    video_fps: float,
+    num_frames: int,
+    clip_seconds: float,
+) -> list[int]:
+    if frame_index < 0:
+        raise ValueError("frame_index must be non-negative")
+    if not math.isfinite(video_fps) or video_fps <= 0:
+        raise ValueError("video_fps must be greater than zero")
+    if num_frames < 1:
+        raise ValueError("num_frames must be at least one")
+    if not math.isfinite(clip_seconds) or clip_seconds <= 0:
+        raise ValueError("clip_seconds must be greater than zero")
+
+    window_span = max(1, round(video_fps * clip_seconds))
+    start_index = max(0, frame_index - window_span)
+    return [
+        round(start_index + offset * (frame_index - start_index) / (num_frames - 1))
+        if num_frames > 1
+        else frame_index
+        for offset in range(num_frames)
+    ]
+
+
+def split_annotation_indices(
+    annotations: Sequence[Annotation],
+    validation_split: float,
+    seed: int,
+    clip_seconds: float = 0.0,
+) -> tuple[list[int], list[int]]:
+    if not 0 <= validation_split < 1:
+        raise ValueError("--validation-split must be in the range [0, 1)")
+    if not math.isfinite(clip_seconds) or clip_seconds < 0:
+        raise ValueError("clip_seconds must be finite and non-negative")
+    if validation_split == 0:
+        return list(range(len(annotations))), []
+
+    videos = sorted({annotation.video for annotation in annotations})
+    if len(videos) > 1:
+        shuffled_videos = list(videos)
+        random.Random(seed).shuffle(shuffled_videos)
+        validation_video_count = min(
+            len(videos) - 1,
+            max(1, math.ceil(len(videos) * validation_split)),
+        )
+        validation_videos = set(shuffled_videos[:validation_video_count])
+        validation_indices = [
+            index
+            for index, annotation in enumerate(annotations)
+            if annotation.video in validation_videos
+        ]
+        train_indices = [
+            index
+            for index, annotation in enumerate(annotations)
+            if annotation.video not in validation_videos
+        ]
+        return train_indices, validation_indices
+
+    chronological_indices = sorted(
+        range(len(annotations)),
+        key=lambda index: annotations[index].timestamp_seconds,
+    )
+    validation_count = int(len(annotations) * validation_split)
+    if validation_count == 0:
+        minimum_examples = math.ceil(1 / validation_split)
+        raise ValueError(
+            f"At least {minimum_examples} labeled examples are required for "
+            f"--validation-split {validation_split:g}"
+        )
+    validation_indices = chronological_indices[-validation_count:]
+    first_validation_time = annotations[validation_indices[0]].timestamp_seconds
+    train_indices = [
+        index
+        for index in chronological_indices[:-validation_count]
+        if annotations[index].timestamp_seconds <= first_validation_time - clip_seconds
+    ]
+    if not train_indices:
+        raise ValueError(
+            "The chronological split leaves no training clips after separating "
+            "the validation window; add more labeled video or reduce "
+            "--validation-split/--clip-seconds"
+        )
+    return (
+        train_indices,
+        validation_indices,
+    )
+
+
+def _prepare_video_dataset(
+    annotations,
+    actions,
+    frame_width,
+    frame_height,
+    num_frames,
+    clip_seconds,
+    cv2,
+    np,
+    torch,
+):
     action_indices = {action: index for index, action in enumerate(actions)}
     video_info = {}
 
@@ -188,7 +311,7 @@ def _prepare_dataset(annotations, actions, frame_width, frame_height, cv2, np, t
                 f"(duration {duration:.3f}s)"
             )
 
-    class VideoActionDataset(torch.utils.data.Dataset):
+    class VideoClipDataset(torch.utils.data.Dataset):
         def __init__(self):
             self.captures = {}
 
@@ -207,31 +330,57 @@ def _prepare_dataset(annotations, actions, frame_width, frame_height, cv2, np, t
 
             fps, _ = video_info[annotation.video]
             frame_index = int(round(annotation.timestamp_seconds * fps))
-            capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
-            success, frame = capture.read()
-            if not success:
-                raise RuntimeError(
-                    f"Could not read frame {frame_index} from {annotation.video}"
-                )
-
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frame = cv2.resize(
-                frame,
-                (frame_width, frame_height),
-                interpolation=cv2.INTER_AREA,
+            frame_indices = sample_clip_indices(
+                frame_index,
+                fps,
+                num_frames,
+                clip_seconds,
             )
-            image = np.ascontiguousarray(np.transpose(frame, (2, 0, 1)))
+            selected_indices = set(frame_indices)
+            first_index, last_index = frame_indices[0], frame_indices[-1]
+            capture.set(cv2.CAP_PROP_POS_FRAMES, first_index)
+            sampled_frames = {}
+            for current_index in range(first_index, last_index + 1):
+                success, frame = capture.read()
+                if not success:
+                    raise RuntimeError(
+                        f"Could not read frame {current_index} from {annotation.video}"
+                    )
+                if current_index not in selected_indices:
+                    continue
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frame = cv2.resize(
+                    frame,
+                    (frame_width, frame_height),
+                    interpolation=cv2.INTER_AREA,
+                )
+                sampled_frames[current_index] = frame
+
+            frames = np.stack(
+                [sampled_frames[frame_number] for frame_number in frame_indices],
+                axis=0,
+            )
+            clip = torch.from_numpy(
+                np.ascontiguousarray(np.transpose(frames, (3, 0, 1, 2)))
+            )
             target = np.zeros(len(actions), dtype=np.float32)
             for action in annotation.actions:
                 target[action_indices[action]] = 1.0
-            return torch.from_numpy(image), torch.from_numpy(target)
+            return clip, torch.from_numpy(target)
 
         def close(self):
             for capture in self.captures.values():
                 capture.release()
             self.captures.clear()
 
-    return VideoActionDataset()
+    return VideoClipDataset()
+
+
+def _normalize_video_batch(clips, torch, device):
+    clips = clips.to(device=device, dtype=torch.float32) / 255.0
+    mean = torch.tensor(VIDEO_NORMALIZATION_MEAN, device=device).view(1, 3, 1, 1, 1)
+    std = torch.tensor(VIDEO_NORMALIZATION_STD, device=device).view(1, 3, 1, 1, 1)
+    return (clips - mean) / std
 
 
 def _select_device(torch, requested: str):
@@ -261,8 +410,12 @@ def train(args: argparse.Namespace) -> Path:
         raise ValueError("--learning-rate must be greater than 0")
     if not 0 <= args.validation_split < 1:
         raise ValueError("--validation-split must be in the range [0, 1)")
-    if args.frame_width < 36 or args.frame_height < 36:
-        raise ValueError("--frame-width and --frame-height must both be at least 36")
+    if args.frame_width < 32 or args.frame_height < 32:
+        raise ValueError("--frame-width and --frame-height must both be at least 32")
+    if args.num_frames < 2:
+        raise ValueError("--num-frames must be at least 2")
+    if not math.isfinite(args.clip_seconds) or args.clip_seconds <= 0:
+        raise ValueError("--clip-seconds must be greater than 0")
 
     annotations = load_annotations(args.labels, args.videos)
     actions = action_vocabulary(annotations)
@@ -270,32 +423,34 @@ def train(args: argparse.Namespace) -> Path:
     torch.manual_seed(args.seed)
 
     device = _select_device(torch, args.device)
-    dataset = _prepare_dataset(
+    dataset = _prepare_video_dataset(
         annotations,
         actions,
         args.frame_width,
         args.frame_height,
+        args.num_frames,
+        args.clip_seconds,
         cv2,
         np,
         torch,
     )
 
     try:
-        validation_count = int(len(dataset) * args.validation_split)
-        if args.validation_split > 0 and validation_count == 0:
-            minimum_examples = math.ceil(1 / args.validation_split)
-            raise ValueError(
-                f"At least {minimum_examples} labeled examples are required for "
-                f"--validation-split {args.validation_split:g}"
-            )
-        train_count = len(dataset) - validation_count
+        train_indices, validation_indices = split_annotation_indices(
+            annotations,
+            args.validation_split,
+            args.seed,
+            args.clip_seconds,
+        )
+        if not train_indices:
+            raise ValueError("The training split contains no labeled examples")
         generator = torch.Generator().manual_seed(args.seed)
-        if validation_count:
-            train_dataset, validation_dataset = torch.utils.data.random_split(
-                dataset, [train_count, validation_count], generator=generator
-            )
-        else:
-            train_dataset, validation_dataset = dataset, None
+        train_dataset = torch.utils.data.Subset(dataset, train_indices)
+        validation_dataset = (
+            torch.utils.data.Subset(dataset, validation_indices)
+            if validation_indices
+            else None
+        )
 
         train_loader = torch.utils.data.DataLoader(
             train_dataset,
@@ -315,14 +470,21 @@ def train(args: argparse.Namespace) -> Path:
             else None
         )
 
-        model = _build_policy(
-            torch,
-            len(actions),
-            args.frame_width,
-            args.frame_height,
-        ).to(device)
-        optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
-        loss_function = torch.nn.BCEWithLogitsLoss()
+        model = _build_video_policy(torch, len(actions), pretrained=True).to(device)
+        optimizer = torch.optim.Adam(model.fc.parameters(), lr=args.learning_rate)
+        positive_counts = np.zeros(len(actions), dtype=np.float32)
+        for annotation_index in train_indices:
+            for action in annotations[annotation_index].actions:
+                positive_counts[actions.index(action)] += 1
+        positive_weights = np.clip(
+            (len(train_indices) - positive_counts)
+            / np.maximum(positive_counts, 1.0),
+            1.0,
+            20.0,
+        )
+        loss_function = torch.nn.BCEWithLogitsLoss(
+            pos_weight=torch.as_tensor(positive_weights, device=device)
+        )
         best_validation_loss = math.inf
 
         def evaluate(loader):
@@ -330,29 +492,34 @@ def train(args: argparse.Namespace) -> Path:
             total_loss = 0.0
             total_examples = 0
             with torch.no_grad():
-                for images, targets in loader:
-                    images = images.to(device=device, dtype=torch.float32) / 255.0
+                for clips, targets in loader:
+                    clips = _normalize_video_batch(clips, torch, device)
                     targets = targets.to(device=device)
-                    loss = loss_function(model(images), targets)
-                    total_loss += loss.item() * len(images)
-                    total_examples += len(images)
+                    loss = loss_function(model(clips), targets)
+                    total_loss += loss.item() * len(clips)
+                    total_examples += len(clips)
             return total_loss / total_examples
 
         output_path = args.output.expanduser().resolve()
         output_path.parent.mkdir(parents=True, exist_ok=True)
         for epoch in range(1, args.epochs + 1):
             model.train()
+            model.stem.eval()
+            model.layer1.eval()
+            model.layer2.eval()
+            model.layer3.eval()
+            model.layer4.eval()
             total_loss = 0.0
             total_examples = 0
-            for images, targets in train_loader:
-                images = images.to(device=device, dtype=torch.float32) / 255.0
+            for clips, targets in train_loader:
+                clips = _normalize_video_batch(clips, torch, device)
                 targets = targets.to(device=device)
                 optimizer.zero_grad(set_to_none=True)
-                loss = loss_function(model(images), targets)
+                loss = loss_function(model(clips), targets)
                 loss.backward()
                 optimizer.step()
-                total_loss += loss.item() * len(images)
-                total_examples += len(images)
+                total_loss += loss.item() * len(clips)
+                total_examples += len(clips)
 
             train_loss = total_loss / total_examples
             if validation_loader is not None:
@@ -371,13 +538,19 @@ def train(args: argparse.Namespace) -> Path:
             if should_save:
                 torch.save(
                     {
-                        "format_version": 1,
+                        "format_version": 2,
+                        "architecture": VIDEO_ARCHITECTURE,
                         "model_state_dict": model.state_dict(),
                         "action_labels": actions,
                         "frame_width": args.frame_width,
                         "frame_height": args.frame_height,
+                        "num_frames": args.num_frames,
+                        "clip_seconds": args.clip_seconds,
+                        "normalization_mean": VIDEO_NORMALIZATION_MEAN,
+                        "normalization_std": VIDEO_NORMALIZATION_STD,
+                        "pretrained_weights": "R3D_18_Weights.DEFAULT",
                         "input_color_space": "RGB",
-                        "input_layout": "NCHW",
+                        "input_layout": "NCTHW",
                     },
                     output_path,
                 )
@@ -389,7 +562,10 @@ def train(args: argparse.Namespace) -> Path:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Train a multi-label Powerline.io policy from annotated MP4 frames."
+        description=(
+            "Fine-tune a pretrained R3D-18 video model on timestamped "
+            "Powerline.io action labels."
+        )
     )
     parser.add_argument(
         "--videos",
@@ -409,12 +585,19 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("models/powerline_behavior.pt"),
         help="Checkpoint path (default: models/powerline_behavior.pt)",
     )
-    parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--validation-split", type=float, default=0.2)
-    parser.add_argument("--frame-width", type=int, default=84)
-    parser.add_argument("--frame-height", type=int, default=84)
+    parser.add_argument("--frame-width", type=int, default=112)
+    parser.add_argument("--frame-height", type=int, default=112)
+    parser.add_argument("--num-frames", type=int, default=16)
+    parser.add_argument(
+        "--clip-seconds",
+        type=float,
+        default=1.5,
+        help="Temporal window ending at each action label (default: 1.5)",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--device",
