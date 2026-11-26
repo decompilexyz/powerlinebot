@@ -40,6 +40,34 @@ round-02.mp4,8.5,
 The sample labels above are illustrative only; provide the action names and
 timestamps that match your own recordings and controller mapping.
 
+## Record a new training session (keyboard controls)
+
+The existing MP4s do not contain arrow-key events, so the script cannot recover
+those labels from the old recordings. To make a synchronized video and labels
+file automatically, install the dependencies above, put the game in fullscreen,
+then run:
+
+```bash
+python record_gameplay.py --output-dir recordings/run-01
+```
+
+The recorder waits three seconds, captures the primary display at 10 frames per
+second, and records only which arrow keys are held at each frame. Press `Esc`
+to stop. It creates `gameplay.mp4` and `actions.csv` in the output directory;
+choose a different directory for each run. Close unrelated private windows
+before recording. On macOS, grant Screen Recording and Input Monitoring
+permissions to the terminal or Python if the system requests them, then restart
+the terminal.
+
+Train from that recorded run with:
+
+```bash
+python train.py \
+  --videos recordings/run-01 \
+  --labels recordings/run-01/actions.csv \
+  --output models/powerline_behavior.pt
+```
+
 ## Train
 
 Point `--videos` at a single MP4 or a directory of recordings:

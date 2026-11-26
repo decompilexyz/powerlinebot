@@ -15,6 +15,7 @@ runs/
 checkpoints/
 models/
 logs/
+recordings/
 
 # System
 .DS_Store
