@@ -1,9 +1,10 @@
 # Powerline.io video behavior cloning
 
 `train.py` learns a visual action policy from gameplay frames paired with the
-controls that were active in those frames. It does not open a browser, play the
-game, or infer controller inputs from pixels: each training example must be
-annotated in a CSV file.
+controls that were active in those frames. It does not infer controller inputs
+from pixels: each training example must be annotated in a CSV file. `play.py`
+can preview the trained model and, when explicitly enabled, send arrow keys to
+the game.
 
 ## Install
 
@@ -88,4 +89,25 @@ common starting point).
 
 This is supervised behavior cloning, not reinforcement learning. Its quality
 depends on accurate, representative labels; it does not discover better play
-than the demonstrations or interact with Powerline.io on its own.
+than the demonstrations.
+
+## Test the trained model
+
+Put the game in fullscreen on the same display used for recording. First run a
+prediction preview; this does not send any keys:
+
+```bash
+python play.py --model models/powerline_behavior.pt
+```
+
+Press `Esc` to stop. If the predictions look reasonable, try a short session in
+practice mode with explicit key control enabled:
+
+```bash
+python play.py --model models/powerline_behavior.pt --play
+```
+
+The runner only sends arrow keys, and `Esc` stops it and releases held keys.
+On macOS, allow Screen Recording and Input Monitoring if prompted. Start with a
+short session: a small training recording is only a smoke test, and the model
+may not play well until it has more varied demonstrations.
