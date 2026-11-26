@@ -274,9 +274,10 @@ def train(args: argparse.Namespace) -> Path:
     try:
         validation_count = int(len(dataset) * args.validation_split)
         if args.validation_split > 0 and validation_count == 0:
+            minimum_examples = math.ceil(1 / args.validation_split)
             raise ValueError(
-                "At least two labeled examples are required when "
-                "--validation-split is greater than 0"
+                f"At least {minimum_examples} labeled examples are required for "
+                f"--validation-split {args.validation_split:g}"
             )
         train_count = len(dataset) - validation_count
         generator = torch.Generator().manual_seed(args.seed)
