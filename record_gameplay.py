@@ -85,7 +85,7 @@ def record_gameplay(output_dir: Path, monitor_index: int, fps: float) -> tuple[P
         with pressed_lock:
             pressed.clear()
 
-        with mss.mss() as screen:
+        with mss.MSS() as screen:
             if monitor_index < 0 or monitor_index >= len(screen.monitors):
                 raise ValueError(
                     f"Monitor {monitor_index} is unavailable; "

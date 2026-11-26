@@ -1,137 +1,108 @@
-# Powerline.io video behavior cloning
+# Powerline.io temporal video policy
 
-`train.py` learns a visual action policy from gameplay frames paired with the
-controls that were active in those frames. It does not infer controller inputs
-from pixels: each training example must be annotated in a CSV file. `play.py`
-can preview the trained model and, when explicitly enabled, send arrow keys to
-the game.
+`train.py` fine-tunes a pretrained 3D ResNet-18 (`r3d_18`) on short video clips.
+Unlike the earlier frame-only model, it processes 16 ordered frames over a
+1.5-second window and predicts the arrow keys recorded at the end of that
+window. This is supervised behavior cloning: it imitates demonstrated controls
+and does not learn a reward for collecting food.
+
+Gameplay pixels alone do not reveal which action was correct. Training therefore
+requires an `actions.csv` with timestamps and arrow-key labels. Existing MP4s
+without labels cannot directly train a playable policy; use `record_gameplay.py`
+to create synchronized video and labels, or annotate your old videos.
 
 ## Install
 
-Use Python 3.10 or newer. Install the training and video-decoding dependencies:
+Use Python 3.10 or newer and install the dependencies:
 
 ```bash
 python -m pip install -r requirements.txt
 ```
 
-PyTorch chooses the available accelerator automatically by default (CUDA, then
-Apple MPS, then CPU). Install the appropriate PyTorch build for your machine if
-the default package does not provide your desired accelerator.
+The first training run downloads the pretrained R3D-18 Kinetics weights. To
+use an accelerator, choose the device explicitly: `mps` on Apple Silicon,
+`cuda` on an NVIDIA machine, or `cpu`. `auto` prefers CUDA, then MPS, then CPU.
+Install matching PyTorch and torchvision builds for your platform.
 
-## Annotate gameplay
+## Record video with action labels
 
-Create a CSV with one labeled sample per row:
-
-```csv
-video,timestamp_seconds,actions
-round-01.mp4,3.2,left
-round-01.mp4,4.0,left|boost
-round-02.mp4,8.5,
-```
-
-- `video` is a path relative to the `--videos` directory. When `--videos`
-  points to one file, use that file's basename.
-- `timestamp_seconds` is the frame time measured from the beginning of that
-  video.
-- `actions` contains the exact action names you want the model to predict.
-  Separate simultaneously active controls with `|`; leave it blank when no
-  control is active. The action vocabulary is learned from the labels and is
-  not hard-coded by the script.
-
-The sample labels above are illustrative only; provide the action names and
-timestamps that match your own recordings and controller mapping.
-
-## Record a new training session (keyboard controls)
-
-The existing MP4s do not contain arrow-key events, so the script cannot recover
-those labels from the old recordings. To make a synchronized video and labels
-file automatically, install the dependencies above, put the game in fullscreen,
-then run:
+Put the game fullscreen on the monitor you want to record, then run:
 
 ```bash
 python record_gameplay.py --output-dir recordings/run-01
 ```
 
-The recorder waits three seconds, captures the primary display at 10 frames per
-second, and records only which arrow keys are held at each frame. Press `Esc`
-to stop. It creates `gameplay.mp4` and `actions.csv` in the output directory;
-choose a different directory for each run. Close unrelated private windows
-before recording. On macOS, grant Screen Recording and Input Monitoring
-permissions to the terminal or Python if the system requests them, then restart
-the terminal.
+It records screen frames and currently held arrow keys at 10 FPS. Press `Esc`
+to stop. Each run creates `gameplay.mp4` and `actions.csv`; choose a new output
+directory for every run. On macOS, grant Screen Recording and Input Monitoring
+permissions to Terminal/Python if prompted.
 
-Train from that recorded run with:
+To improve the demonstrations, intentionally steer toward food and include
+different situations, turns, and neutral frames. The model learns the recorded
+behavior; it cannot infer a food-collection objective from unlabeled footage.
+
+## Train
+
+Train from a recorded run using the pretrained 3D CNN:
 
 ```bash
 python train.py \
   --videos recordings/run-01 \
   --labels recordings/run-01/actions.csv \
-  --output models/powerline_behavior.pt
+  --output models/powerline_video.pt \
+  --device mps
 ```
 
-## Train
+The CSV columns are `video,timestamp_seconds,actions`. `actions` can contain
+multiple simultaneous keys separated by `|`, or be blank when no key is held.
+The model uses that row's action as the label for a clip ending at its
+timestamp. If a directory contains multiple videos, the validation split holds
+out entire videos; for a single video it uses a chronological split.
 
-Point `--videos` at a single MP4 or a directory of recordings:
+Useful options:
+
+- `--num-frames` (default 16) and `--clip-seconds` (default 1.5) control the
+  temporal window.
+- `--frame-width` and `--frame-height` default to 112, as expected by the
+  pretrained video model.
+- `--batch-size` defaults to 4 because 3D CNNs use more memory.
+- `--epochs`, `--learning-rate`, `--validation-split`, and `--seed` adjust
+  training.
+
+If MPS or CUDA runs out of memory, lower `--batch-size`, for example to 2.
+The saved checkpoint records the architecture, action labels, clip length, and
+normalization needed by `play.py`.
+
+## Test the trained policy
+
+Keep the game fullscreen on the same monitor used for recording. Preview first;
+this does not send keys:
 
 ```bash
-python train.py \
-  --videos "$HOME/Videos/powerline" \
-  --labels "$HOME/Videos/powerline/actions.csv" \
-  --output models/powerline_behavior.pt
+python play.py --model models/powerline_video.pt --device mps
 ```
 
-Useful options include `--epochs`, `--batch-size`, `--validation-split`,
-`--frame-width`, `--frame-height`, `--seed`, and `--device auto|cpu|cuda|mps`.
-The checkpoint contains model weights, action labels, and image preprocessing
-dimensions. Each action has an independent sigmoid probability; a consuming
-controller can interpret probabilities at its chosen threshold (0.5 is a
-common starting point).
-
-This is supervised behavior cloning, not reinforcement learning. Its quality
-depends on accurate, representative labels; it does not discover better play
-than the demonstrations.
-
-## Test the trained model
-
-Put the game in fullscreen on the same display used for recording. First run a
-prediction preview; this does not send any keys:
+The runner collects a rolling clip before making its first prediction. Press
+`Esc` to stop. If predictions look plausible, test live control briefly in
+practice mode:
 
 ```bash
-python play.py --model models/powerline_behavior.pt
+python play.py --model models/powerline_video.pt --device mps --play
 ```
 
-Press `Esc` to stop. If the predictions look reasonable, try a short session in
-practice mode with explicit key control enabled:
+Live control is opt-in. The model only imitates its demonstrations, so more
+varied, intentionally food-seeking examples are needed for a better policy.
 
-```bash
-python play.py --model models/powerline_behavior.pt --play
-```
+## Experimental food-targeting heuristic
 
-The runner only sends arrow keys, and `Esc` stops it and releases held keys.
-On macOS, allow Screen Recording and Input Monitoring if prompted. Start with a
-short session: a small training recording is only a smoke test, and the model
-may not play well until it has more varied demonstrations.
-
-### Experimental food targeting
-
-The trained policy imitates recorded key presses; it does not identify food or
-optimize for collecting it. For a rough food-targeting experiment, `play.py`
-also has a heuristic mode that looks for small, bright, saturated, round blobs
-and points toward the nearest one relative to the center of the captured
-screen. It does not use or require a model:
+The optional `--food-seeking` mode does not use a trained model. It looks for
+small, saturated, round neon blobs and points toward the nearest one from the
+screen center:
 
 ```bash
 python play.py --food-seeking
 ```
 
-This mode is preview-only unless `--play` is explicitly supplied. Check its
-suggested targets before enabling live control:
-
-```bash
-python play.py --food-seeking --play
-```
-
-The detector is an untrained visual heuristic, not a game-aware planner. Neon
-player trails or other effects may be mistaken for food, and the controller
-does not avoid walls or other players. Use it only in a supervised practice
-session; if the preview targets the wrong objects, do not enable `--play`.
+This is preview-only unless `--play` is supplied. The detector may mistake
+player trails or other effects for food, and it does not avoid walls or other
+players. Inspect the preview before enabling live control.
