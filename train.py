@@ -109,6 +109,14 @@ def action_vocabulary(annotations: Sequence[Annotation]) -> list[str]:
     return sorted({action for item in annotations for action in item.actions})
 
 
+def _conv_feature_size(size: int) -> int:
+    for kernel_size, stride in ((8, 4), (4, 2), (3, 1)):
+        size = (size - kernel_size) // stride + 1
+        if size < 1:
+            raise ValueError("Frame dimensions are too small for the CNN")
+    return size
+
+
 def _load_training_dependencies():
     try:
         import cv2
@@ -122,8 +130,10 @@ def _load_training_dependencies():
     return cv2, np, torch
 
 
-def _build_policy(torch, action_count: int):
+def _build_policy(torch, action_count: int, frame_width: int, frame_height: int):
     nn = torch.nn
+    feature_width = _conv_feature_size(frame_width)
+    feature_height = _conv_feature_size(frame_height)
 
     class VisionPolicy(nn.Module):
         def __init__(self):
@@ -135,11 +145,10 @@ def _build_policy(torch, action_count: int):
                 nn.ReLU(),
                 nn.Conv2d(64, 64, kernel_size=3, stride=1),
                 nn.ReLU(),
-                nn.AdaptiveAvgPool2d((4, 4)),
                 nn.Flatten(),
             )
             self.classifier = nn.Sequential(
-                nn.Linear(64 * 4 * 4, 256),
+                nn.Linear(64 * feature_width * feature_height, 256),
                 nn.ReLU(),
                 nn.Linear(256, action_count),
             )
@@ -306,7 +315,12 @@ def train(args: argparse.Namespace) -> Path:
             else None
         )
 
-        model = _build_policy(torch, len(actions)).to(device)
+        model = _build_policy(
+            torch,
+            len(actions),
+            args.frame_width,
+            args.frame_height,
+        ).to(device)
         optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
         loss_function = torch.nn.BCEWithLogitsLoss()
         best_validation_loss = math.inf
