@@ -111,3 +111,27 @@ The runner only sends arrow keys, and `Esc` stops it and releases held keys.
 On macOS, allow Screen Recording and Input Monitoring if prompted. Start with a
 short session: a small training recording is only a smoke test, and the model
 may not play well until it has more varied demonstrations.
+
+### Experimental food targeting
+
+The trained policy imitates recorded key presses; it does not identify food or
+optimize for collecting it. For a rough food-targeting experiment, `play.py`
+also has a heuristic mode that looks for small, bright, saturated, round blobs
+and points toward the nearest one relative to the center of the captured
+screen. It does not use or require a model:
+
+```bash
+python play.py --food-seeking
+```
+
+This mode is preview-only unless `--play` is explicitly supplied. Check its
+suggested targets before enabling live control:
+
+```bash
+python play.py --food-seeking --play
+```
+
+The detector is an untrained visual heuristic, not a game-aware planner. Neon
+player trails or other effects may be mistaken for food, and the controller
+does not avoid walls or other players. Use it only in a supervised practice
+session; if the preview targets the wrong objects, do not enable `--play`.
